@@ -1973,13 +1973,8 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
             }
 
             // Close the producer since topic does not exist.
-            if (cause instanceof PulsarClientException.TopicDoesNotExistException) {
-                closeAsync().whenComplete((v, ex) -> {
-                    if (ex != null) {
-                        log.error("Failed to close producer on TopicDoesNotExistException.", ex);
-                    }
-                    producerCreatedFuture.completeExceptionally(cause);
-                });
+            if (isUnrecoverableError(cause)) {
+                closeWhenReceivedUnrecoverableError(cause, cnx);
                 future.complete(null);
                 return null;
             }
@@ -2051,8 +2046,28 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
         return future;
     }
 
+    protected boolean isUnrecoverableError(Throwable t) {
+        // TopicDoesNotExistException: topic has been deleted.
+        // NotFoundException: topic has been deleted.
+        // IllegalStateException: producer has been closed.
+        return (t instanceof PulsarClientException.TopicDoesNotExistException) || (t instanceof IllegalStateException)
+                || (t instanceof PulsarClientException.NotFoundException);
+    }
+
+    protected void closeWhenReceivedUnrecoverableError(Throwable t, ClientCnx cnx) {
+        final String cnxStr = cnx == null ? "null" : String.valueOf(cnx.channel().remoteAddress());
+        log.warn("[{}][{}] {} Closed producer because get an error that does not support to retry: {} {}",
+                topic, producerName, cnxStr, t.getClass().getName(), t.getMessage());
+        closeAsync().whenComplete((v, ex) -> {
+            if (ex != null) {
+                log.error("Failed to close producer on TopicDoesNotExistException.", ex);
+            }
+            producerCreatedFuture.completeExceptionally(t);
+        });
+    }
+
     @Override
-    public void connectionFailed(PulsarClientException exception) {
+    public boolean connectionFailed(PulsarClientException exception) {
         boolean nonRetriableError = !PulsarClientException.isRetriableError(exception);
         boolean timeout = System.currentTimeMillis() > lookupDeadline;
         if (nonRetriableError || timeout) {
@@ -2067,10 +2082,18 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
                 closeProducerTasks();
                 setState(State.Failed);
                 client.cleanupProducer(this);
+                return false;
+            } else {
+                Throwable actError = FutureUtil.unwrapCompletionException(exception);
+                if (isUnrecoverableError(actError)) {
+                    closeWhenReceivedUnrecoverableError(actError, null);
+                    return false;
+                }
             }
         } else {
             previousExceptionCount.incrementAndGet();
         }
+        return true;
     }
 
     private void closeProducerTasks() {
@@ -2464,6 +2487,7 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
      *     3-1-1. If {@link #pauseSendingToPreservePublishOrderOnSchemaRegFailure} is true pause all following
      *       publishing to avoid out-of-order issue.
      *     3-1-2. Otherwise, discard the failed message anc continuously publishing the following messages.
+     *            Additionally, the following messages may need schema registration also.
      *   3-2. The new schema registration failed due to other error, retry registering.
      * Note: Since the current method accesses & modifies {@link #pendingMessages}, you should acquire a lock on
      *       {@link ProducerImpl} before calling method.
@@ -2482,6 +2506,7 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
         Iterator<OpSendMsg> msgIterator = pendingMessages.iterator();
         MessageImpl loopStartAt = latestMsgAttemptedRegisteredSchema;
         OpSendMsg loopEndDueToSchemaRegisterNeeded = null;
+        boolean pausedSendingToPreservePublishOrderOnSchemaRegFailure = false;
         while (msgIterator.hasNext()) {
             OpSendMsg op = msgIterator.next();
             if (loopStartAt != null) {
@@ -2526,6 +2551,7 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
                                 + " 2) Unload topic on target cluster. Schema details: {}",
                                 topic, producerName, SchemaUtils.jsonifySchemaInfo(msgSchemaInfo, false));
                         loopEndDueToSchemaRegisterNeeded = op;
+                        pausedSendingToPreservePublishOrderOnSchemaRegFailure = true;
                         break;
                     }
                     // Event 3-1-2.
@@ -2581,7 +2607,7 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
         }
         cnx.ctx().flush();
 
-        // "Event 1-1" or "Event 3-1-1" or "Event 3-2".
+        // "Event 1-1" or "Event 3-1-1" or "Event 3-1-2" or "Event 3-2".
         if (loopEndDueToSchemaRegisterNeeded != null) {
             if (compareAndSetState(State.Connecting, State.Ready)) {
                 // "Event 1-1" happens after "Event 3-1-1".
@@ -2589,15 +2615,19 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
                 // after users changed the compatibility strategy to make the schema is compatible.
                 tryRegisterSchema(cnx, loopEndDueToSchemaRegisterNeeded.msg, loopEndDueToSchemaRegisterNeeded.callback,
                     expectedEpoch);
-            } else if (!failedIncompatibleSchema && compareAndSetState(State.RegisteringSchema, State.Ready)) {
-                // "Event 2-1" or "Event 3-2".
+            } else if (pausedSendingToPreservePublishOrderOnSchemaRegFailure) {
+                // Nothing to do if the event is "Event 3-1-1", just keep stuck.
+                return;
+            } else if (compareAndSetState(State.RegisteringSchema, State.Ready)) {
+                // "Event 2-1" or "Event 3-1-2" or "Event 3-2".
                 // "pendingMessages" has more messages to register new schema.
                 // This operation will not be conflict with another schema registration because both operations are
                 // attempt to acquire the same lock "ProducerImpl.this".
                 tryRegisterSchema(cnx, loopEndDueToSchemaRegisterNeeded.msg, loopEndDueToSchemaRegisterNeeded.callback,
                         expectedEpoch);
             }
-            // Nothing to do if the event is "Event 3-1-1", just keep stuck.
+            // Schema registration will trigger a new "recoverProcessOpSendMsgFrom", so return here. If failed to switch
+            // state, it means another task will trigger a new "recoverProcessOpSendMsgFrom".
             return;
         } else if (latestMsgAttemptedRegisteredSchema != null) {
             // Event 2-2 or "Event 3-1-2".

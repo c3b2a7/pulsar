@@ -2899,6 +2899,9 @@ public class ManagedCursorTest extends MockedBookKeeperTestCase {
         EntryImpl entry5 = EntryImpl.create(markDeletedPosition.getLedgerId(), markDeletedPosition.getEntryId() + 7,
                 ByteBufAllocator.DEFAULT.buffer(0));
         List<Entry> entries = Lists.newArrayList(entry1, entry2, entry3, entry4, entry5);
+        // release data buffers since EntryImpl.create will retain the buffer
+        entries.forEach(entry -> entry.getDataBuffer().release());
+
         c1.trimDeletedEntries(entries);
         assertEquals(entries.size(), 1);
         assertEquals(entries.get(0).getPosition(), PositionFactory.create(markDeletedPosition.getLedgerId(),
@@ -2908,6 +2911,9 @@ public class ManagedCursorTest extends MockedBookKeeperTestCase {
         assertEquals(entry2.refCnt(), 0);
         assertEquals(entry3.refCnt(), 0);
         assertEquals(entry4.refCnt(), 0);
+
+        // release remaining entry
+        entries.forEach(Entry::release);
     }
 
     @Test(timeOut = 20000)
@@ -5186,6 +5192,21 @@ public class ManagedCursorTest extends MockedBookKeeperTestCase {
     }
 
     @Test
+    public void testDeleteBatchedMessageWithEmptyAckSet() throws Exception {
+        ManagedLedgerConfig managedLedgerConfig = new ManagedLedgerConfig();
+        managedLedgerConfig.setDeletionAtBatchIndexLevelEnabled(false);
+        ManagedLedgerImpl ml = (ManagedLedgerImpl) factory.open("testDeleteBatchedMessageWithEmptyAckSet",
+            managedLedgerConfig);
+        ManagedCursorImpl cursor = (ManagedCursorImpl) ml.openCursor("c1");
+        Position position = ml.addEntry(new byte[1]);
+        Position positionWithEmptyAckSet =
+                AckSetStateUtil.createPositionWithAckSet(position.getLedgerId(), position.getEntryId(), new long[]{});
+        cursor.delete(positionWithEmptyAckSet);
+        assertEquals(cursor.markDeletePosition, position);
+        ml.delete();
+    }
+
+    @Test
     public void testEstimateEntryCountBySize() throws Exception {
         final String mlName = "ml-" + UUID.randomUUID().toString().replaceAll("-", "");
         ManagedLedgerImpl ml = (ManagedLedgerImpl) factory.open(mlName);
@@ -5286,6 +5307,7 @@ public class ManagedCursorTest extends MockedBookKeeperTestCase {
     @Test
     void testForceCursorRecovery() throws Exception {
         TestPulsarMockBookKeeper bk = new TestPulsarMockBookKeeper(executor);
+        factory.shutdown();
         factory = new ManagedLedgerFactoryImpl(metadataStore, bk);
         ManagedLedgerConfig config = new ManagedLedgerConfig();
         config.setLedgerForceRecovery(true);

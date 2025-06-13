@@ -16,32 +16,12 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.pulsar.tests.integration.containers;
+package org.apache.pulsar.common.stats;
 
-/**
- * A pulsar container that runs configuration store.
- */
-public class CSContainer extends PulsarContainer<CSContainer> {
+import lombok.experimental.UtilityClass;
 
-    public static final String NAME = "configuration-store";
-
-    public CSContainer(String clusterName) {
-        super(
-            clusterName,
-            NAME,
-            NAME,
-            "bin/run-global-zk.sh",
-            CS_PORT,
-            INVALID_PORT);
-    }
-
-    @Override
-    protected boolean isCodeCoverageEnabled() {
-        return false;
-    }
-
-    @Override
-    protected boolean isPassNettyLeakDetectionSystemProperties() {
-        return false;
-    }
+@UtilityClass
+public class CacheMetricsCollector {
+    public static final io.prometheus.client.cache.caffeine.CacheMetricsCollector CAFFEINE =
+        new io.prometheus.client.cache.caffeine.CacheMetricsCollector().register();
 }
